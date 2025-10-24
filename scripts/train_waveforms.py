@@ -46,7 +46,7 @@ def parse_args():
     p.add_argument("--min_sigma", type=float, default=0.0, help="Soft-min noise std in raw units; if >0, use sigma = sqrt((noise_level*s)^2 + min_sigma^2) with s=1.4826*MAD per trace")
     p.add_argument("--scaler", choices=["RobustScaler","StandardScaler","MinMaxScaler"], default="RobustScaler")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--events_per_file", type=int, default=0, help="If input is 3D (E,C,L), randomly sample up to this many events per file before flattening; 0=all")
+    p.add_argument("--events_per_file", type=int, default=2000, help="If input is 3D (E,C,L), randomly sample up to this many events per file before flattening; 0=all")
     # Runlist mode only: read split/run/tower from a text file and build inputs
     p.add_argument("--runlist", required=True, help="Path to run list txt: <split_flag> <run_number> <tower> per line; split_flag in {0=train,1=val,2=test}")
     p.add_argument("--npz_dir", default="/pscratch/sd/h/haeun/TB2025", help="Directory containing per-run npz files (used with --runlist)")
