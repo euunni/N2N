@@ -51,6 +51,7 @@ def parse_args():
     p.add_argument("--runlist", required=True, help="Path to run list txt: <split_flag> <run_number> <tower> per line; split_flag in {0=train,1=val,2=test}")
     p.add_argument("--npz_dir", default="/pscratch/sd/h/haeun/TB2025", help="Directory containing per-run npz files (used with --runlist)")
     p.add_argument("--npz_pattern", default="run_{run}_merged.npz", help="Filename pattern with {run} placeholder (used with --runlist)")
+    p.add_argument("--plot_noise", action="store_true", help="Save original vs noisy plots for event 0 per channel (train split)")
     return p.parse_args()
 
 def set_seed(seed: int):
@@ -124,6 +125,18 @@ def main():
             arrays.append(load_waveforms(p, npz_key, events_limit=args.events_per_file, seed=args.seed, channels=ch))
         return np.ascontiguousarray(np.concatenate(arrays, axis=0))
 
+    def _load_arrays_with_labels(pairs: list[tuple[str, str]], npz_key: str) -> tuple[list[np.ndarray], list[str]]:
+        """Load each (path, channel) pair separately, returning arrays and labels for logging."""
+        arrays: list[np.ndarray] = []
+        labels: list[str] = []
+        for p, ch in pairs:
+            if not os.path.exists(p):
+                raise FileNotFoundError(f"Input file not found: {p}")
+            arr = load_waveforms(p, npz_key, events_limit=args.events_per_file, seed=args.seed, channels=ch)
+            arrays.append(arr)
+            labels.append(f"{os.path.basename(p)}:{ch}")
+        return arrays, labels
+
     def _read_runlist(path: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[tuple[str, str]]]:
         if not args.npz_dir:
             raise ValueError("--npz_dir is required when using --runlist")
@@ -141,7 +154,6 @@ def main():
                 flag = int(cols[0]); run = int(cols[1]); towers = cols[2:]
                 file_path = os.path.join(args.npz_dir, args.npz_pattern.format(run=run))
                 for tower in towers:
-                    # Only S channel for each specified tower
                     ch = f"{tower}S"
                     pair = (file_path, ch)
                     if flag == 0:
@@ -155,26 +167,100 @@ def main():
         return train_pairs, val_pairs, test_pairs
 
     train_pairs, val_pairs, test_pairs = _read_runlist(args.runlist)
-    X_train_orig = _load_concat_pairs(train_pairs, args.array_key)
-    X_val_orig   = _load_concat_pairs(val_pairs,   args.array_key)
-    X_test_orig  = _load_concat_pairs(test_pairs,  args.array_key)
+    # Load per-pair arrays to enable per-channel noise logging
+    train_arrays, train_labels = _load_arrays_with_labels(train_pairs, args.array_key)
+    val_arrays,   val_labels   = _load_arrays_with_labels(val_pairs,   args.array_key)
+    test_arrays,  test_labels  = _load_arrays_with_labels(test_pairs,  args.array_key)
+
+    # Also keep concatenated originals for shape reporting (optional)
+    X_train_orig = np.ascontiguousarray(np.concatenate(train_arrays, axis=0))
+    X_val_orig   = np.ascontiguousarray(np.concatenate(val_arrays,   axis=0))
+    X_test_orig  = np.ascontiguousarray(np.concatenate(test_arrays,  axis=0))
 
     n_points = X_train_orig.shape[1]
     print(
         f"Loaded shapes (runlist) - train:{X_train_orig.shape}, val:{X_val_orig.shape}, test:{X_test_orig.shape}",
         flush=True,
     )
-    # Noise2Noise: two independent noisy realizations (same clean, different seeds)
-    X_train_noisy1 = generate_noisy_waveforms(X_train_orig, noise_level=args.noise_level, random_seed=args.seed, min_sigma=args.min_sigma)
-    X_val_noisy1   = generate_noisy_waveforms(X_val_orig,   noise_level=args.noise_level, random_seed=args.seed, min_sigma=args.min_sigma)
-    X_test_noisy1  = generate_noisy_waveforms(X_test_orig,  noise_level=args.noise_level, random_seed=args.seed, min_sigma=args.min_sigma)
+    # Noise2Noise: two independent noisy realizations per pair (per-channel logging)
+    def _gen_noisy_pairwise(arrays: list[np.ndarray], labels: list[str], seed_base: int) -> tuple[np.ndarray, np.ndarray]:
+        noisy1_list: list[np.ndarray] = []
+        noisy2_list: list[np.ndarray] = []
+        for i, arr in enumerate(arrays):
+            seed1 = seed_base + i * 2
+            seed2 = seed_base + i * 2 + 1
+            label = labels[i]
+            n1 = generate_noisy_waveforms(
+                arr,
+                noise_level=args.noise_level,
+                random_seed=seed1,
+                min_sigma=args.min_sigma,
+            )
+            n2 = generate_noisy_waveforms(
+                arr,
+                noise_level=args.noise_level,
+                random_seed=seed2,
+                min_sigma=args.min_sigma,
+            )
+            noisy1_list.append(n1)
+            noisy2_list.append(n2)
+        return (
+            np.ascontiguousarray(np.concatenate(noisy1_list, axis=0)),
+            np.ascontiguousarray(np.concatenate(noisy2_list, axis=0)),
+        )
 
-    X_train_noisy2 = generate_noisy_waveforms(X_train_orig, noise_level=args.noise_level, random_seed=args.seed + 1, min_sigma=args.min_sigma)
-    X_val_noisy2   = generate_noisy_waveforms(X_val_orig,   noise_level=args.noise_level, random_seed=args.seed + 2, min_sigma=args.min_sigma)
-    X_test_noisy2  = generate_noisy_waveforms(X_test_orig,  noise_level=args.noise_level, random_seed=args.seed + 3, min_sigma=args.min_sigma)
+    X_train_noisy1, X_train_noisy2 = _gen_noisy_pairwise(train_arrays, train_labels, seed_base=args.seed)
+    X_val_noisy1,   X_val_noisy2   = _gen_noisy_pairwise(val_arrays,   val_labels,   seed_base=args.seed + 100000)
+    X_test_noisy1,  X_test_noisy2  = _gen_noisy_pairwise(test_arrays,  test_labels,  seed_base=args.seed + 200000)
+    # Order for concatenation matches train_arrays order
+    train_labels_ordered = list(train_labels)
 
     # Residual Noise2Noise: learn residual r = noisy1 - noisy2, then ŷ = noisy1 - r
     X_train, y_train = X_train_noisy1, (X_train_noisy1 - X_train_noisy2)
+    # Optional: Plot event 0 original vs noisy per channel (train split)
+    if args.plot_noise:
+        os.makedirs(args.output_dir, exist_ok=True)
+        # Build offsets for each label according to concatenation order
+        size_per_label = {lab: arr.shape[0] for lab, arr in zip(train_labels, train_arrays)}
+        offsets = {}
+        cur = 0
+        for lab in train_labels_ordered:
+            offsets[lab] = cur
+            cur += size_per_label[lab]
+        # Without group info, skip special-case y-limits per first channel or set none.
+        first_labels_set = set()
+        # Plot each channel's event 0
+        for lab in train_labels_ordered:
+            idx0 = offsets[lab]
+            arr_idx = train_labels.index(lab)
+            orig = train_arrays[arr_idx][0]
+            noisy = X_train_noisy1[idx0]
+            plt.figure(figsize=(8, 3))
+            plt.plot(orig, label="original", lw=1.2)
+            plt.plot(noisy, label="noisy1", lw=1.0, alpha=0.8)
+            if lab in first_labels_set:
+                plt.ylim(-20, 20)
+            plt.title(f"Event 0 original vs noisy1\n{lab}")
+            plt.xlabel("sample"); plt.ylabel("amplitude")
+            plt.legend(); plt.tight_layout()
+            out_path = os.path.join(args.output_dir, f"event0_{lab.replace(':','_')}_orig_vs_noisy1.png")
+            plt.savefig(out_path)
+            plt.close()
+
+            # Also plot original vs noisy2
+            noisy2 = X_train_noisy2[idx0]
+            plt.figure(figsize=(8, 3))
+            plt.plot(orig, label="original", lw=1.2)
+            plt.plot(noisy2, label="noisy2", lw=1.0, alpha=0.8)
+            if lab in first_labels_set:
+                plt.ylim(-20, 20)
+            plt.title(f"Event 0 original vs noisy2\n{lab}")
+            plt.xlabel("sample"); plt.ylabel("amplitude")
+            plt.legend(); plt.tight_layout()
+            out_path2 = os.path.join(args.output_dir, f"event0_{lab.replace(':','_')}_orig_vs_noisy2.png")
+            plt.savefig(out_path2)
+            plt.close()
+        print(f"Saved event 0 noise example plots to {args.output_dir}", flush=True)
     X_val,   y_val   = X_val_noisy1,   (X_val_noisy1   - X_val_noisy2)
     X_test,  y_test  = X_test_noisy1,  (X_test_noisy1  - X_test_noisy2)
 
@@ -197,8 +283,8 @@ def main():
     test_loader  = DataLoader(test_ds,  batch_size=args.batch_size, shuffle=False)
 
     # Model
-    # TCN with channel=1, causal (from tcn.py), reasonable defaults
-    model = Noise2Noise1DTCN(in_channels=1, num_channels=None, kernel_size=3, dropout=0.1)
+    # TCN with channel=1, causal (from tcn.py), reasonab le defaults
+    model = Noise2Noise1DTCN(in_channels=1, num_channels=None, kernel_size=5, dropout=0.1)
     device = check_available_device()
     if device == "cuda" and torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)

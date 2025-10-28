@@ -56,7 +56,7 @@ class TemporalBlock(nn.Module):
 
 
 class TemporalConvNet(nn.Module):
-    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2, use_group_norm: bool = True, gn_groups: int = 8):
+    def __init__(self, num_inputs, num_channels, kernel_size=3, dropout=0.2, use_group_norm: bool = True, gn_groups: int = 8):
         super(TemporalConvNet, self).__init__()
         layers = []
         num_levels = len(num_channels)
@@ -87,9 +87,9 @@ class Noise2Noise1DTCN(nn.Module):
     def __init__(self, in_channels=1, num_channels=None, kernel_size=3, dropout=0.1, use_group_norm: bool = True, gn_groups: int = 8):
         super(Noise2Noise1DTCN, self).__init__()
         if num_channels is None:
-            # Default: 8 levels with increasing channels; receptive field ~ 511 for k=3
             # num_channels = [32, 32, 64, 64, 128, 128, 256, 256]
             num_channels=[8, 8, 16, 16, 32, 32, 64, 64]
+            # num_channels=[8, 8, 8, 16, 16, 16]
         self.tcn = TemporalConvNet(
             num_inputs=in_channels,
             num_channels=num_channels,
