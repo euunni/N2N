@@ -18,8 +18,15 @@ def check_available_device() -> str:
 
 def train(model, optimizer, criterion, data_loader, device):
     model.train()
-    train_loss = 0
-    for inputs, targets in data_loader:
+    running = 0.0
+    iterator = data_loader
+    total = len(data_loader)
+    if _tqdm is not None:
+        try:
+            iterator = _tqdm(data_loader, total=total, desc="Train", leave=False)
+        except Exception:
+            iterator = data_loader
+    for step, (inputs, targets) in enumerate(iterator, 1):
         inputs, targets = inputs.unsqueeze(1), targets.unsqueeze(1)
         inputs, targets = inputs.to(device), targets.to(device)
         optimizer.zero_grad()
@@ -27,21 +34,38 @@ def train(model, optimizer, criterion, data_loader, device):
         loss = criterion(outputs, targets)
         loss.backward()
         optimizer.step()
-        train_loss += loss.item()
-    return train_loss / len(data_loader)
+        running += loss.item()
+        if iterator is not data_loader and hasattr(iterator, "set_postfix"):
+            try:
+                iterator.set_postfix(loss=f"{loss.item():.4f}", avg=f"{running/step:.4f}")
+            except Exception:
+                pass
+    return running / total if total else 0.0
 
 
 def validate(model, criterion, data_loader, device):
     model.eval()
-    val_loss = 0
+    running = 0.0
+    iterator = data_loader
+    total = len(data_loader)
+    if _tqdm is not None:
+        try:
+            iterator = _tqdm(data_loader, total=total, desc="Val", leave=False)
+        except Exception:
+            iterator = data_loader
     with torch.no_grad():
-        for inputs, targets in data_loader:
+        for step, (inputs, targets) in enumerate(iterator, 1):
             inputs, targets = inputs.unsqueeze(1), targets.unsqueeze(1)
             inputs, targets = inputs.to(device), targets.to(device)
             outputs = model(inputs)
             loss = criterion(outputs, targets)
-            val_loss += loss.item()
-    return val_loss / len(data_loader)
+            running += loss.item()
+            if iterator is not data_loader and hasattr(iterator, "set_postfix"):
+                try:
+                    iterator.set_postfix(avg=f"{running/step:.4f}")
+                except Exception:
+                    pass
+    return running / total if total else 0.0
 
 
 def predict(model, data_loader, device, show_progress: bool = False, desc: str = "Predict"):

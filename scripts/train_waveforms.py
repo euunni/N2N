@@ -23,10 +23,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 from joblib import dump
 
 from n2n.tcn import Noise2Noise1DTCN
-from n2n.model_functions import check_available_device, train, validate
+from n2n.model_functions import train, validate
 from n2n.preprocessing import (
     standardise_array,
     generate_noisy_waveforms,
@@ -43,7 +46,7 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--patience", type=int, default=20)
     p.add_argument("--noise_level", type=float, default=0.02)
-    p.add_argument("--min_sigma", type=float, default=0.0, help="Soft-min noise std in raw units; if >0, use sigma = sqrt((noise_level*s)^2 + min_sigma^2) with s=1.4826*MAD per trace")
+    p.add_argument("--min_sigma", type=float, default=5.0, help="Soft-min noise std in raw units; if >0, use sigma = sqrt((noise_level*s)^2 + min_sigma^2) with s=1.4826*MAD per trace")
     p.add_argument("--scaler", choices=["RobustScaler","StandardScaler","MinMaxScaler"], default="RobustScaler")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--events_per_file", type=int, default=2000, help="If input is 3D (E,C,L), randomly sample up to this many events per file before flattening; 0=all")
@@ -52,6 +55,11 @@ def parse_args():
     p.add_argument("--npz_dir", default="/pscratch/sd/h/haeun/TB2025", help="Directory containing per-run npz files (used with --runlist)")
     p.add_argument("--npz_pattern", default="run_{run}_merged.npz", help="Filename pattern with {run} placeholder (used with --runlist)")
     p.add_argument("--plot_noise", action="store_true", help="Save original vs noisy plots for event 0 per channel (train split)")
+    # Checkpoint/resume options
+    p.add_argument("--checkpoint_dir", default=None, help="Directory to save/load checkpoints (default: <output_dir>/checkpoints)")
+    p.add_argument("--resume", action="store_true", help="Resume from latest checkpoint in --checkpoint_dir if available")
+    p.add_argument("--save_every", type=int, default=1, help="Save checkpoint every N epochs")
+    p.add_argument("--total-epochs", dest="total_epochs", type=int, default=0, help="Stop when this many total epochs are reached across resumes; 0 = ignore")
     return p.parse_args()
 
 def set_seed(seed: int):
@@ -112,7 +120,28 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     set_seed(args.seed)
 
-    print("Starting training...", flush=True)
+    # Detect distributed context (torchrun exports LOCAL_RANK/RANK/WORLD_SIZE)
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    is_distributed = world_size > 1 or ("LOCAL_RANK" in os.environ)
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    if is_distributed:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend)
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        rank = 0
+
+    if (not is_distributed) or rank == 0:
+        print("Starting training...", flush=True)
+
+    # Checkpoint directory
+    ckpt_dir = args.checkpoint_dir or os.path.join(args.output_dir, "checkpoints")
+    if (not is_distributed) or rank == 0:
+        os.makedirs(ckpt_dir, exist_ok=True)
 
     def _load_concat_pairs(pairs: list[tuple[str, str]], npz_key: str) -> np.ndarray:
         """Load multiple (path, channels) pairs and concatenate (rows)."""
@@ -278,58 +307,190 @@ def main():
     val_ds   = TensorDataset(torch.from_numpy(X_val_s).float(),   torch.from_numpy(y_val_s).float())
     test_ds  = TensorDataset(torch.from_numpy(X_test_s).float(),  torch.from_numpy(y_test_s).float())
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False)
-    test_loader  = DataLoader(test_ds,  batch_size=args.batch_size, shuffle=False)
+    if is_distributed:
+        train_sampler = DistributedSampler(train_ds, shuffle=True, drop_last=False)
+        val_sampler   = DistributedSampler(val_ds,   shuffle=False, drop_last=False)
+        test_sampler  = DistributedSampler(test_ds,  shuffle=False, drop_last=False)
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False, sampler=train_sampler)
+        val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, sampler=val_sampler)
+        test_loader  = DataLoader(test_ds,  batch_size=args.batch_size, shuffle=False, sampler=test_sampler)
+    else:
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
+        val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False)
+        test_loader  = DataLoader(test_ds,  batch_size=args.batch_size, shuffle=False)
 
     # Model
-    # TCN with channel=1, causal (from tcn.py), reasonab le defaults
+    # TCN with channel=1, causal (from tcn.py), reasonable defaults
     model = Noise2Noise1DTCN(in_channels=1, num_channels=None, kernel_size=5, dropout=0.1)
-    device = check_available_device()
-    if device == "cuda" and torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{local_rank}" if is_distributed else "cuda")
+    else:
+        device = torch.device("cpu")
     model.to(device)
+    if is_distributed:
+        # One process per GPU
+        model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None, output_device=local_rank if torch.cuda.is_available() else None, find_unused_parameters=False)
 
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-    # Train loop with early stopping
+    # Utility: checkpoint helpers
+    def _latest_checkpoint_path(directory: str):
+        try:
+            candidates = [f for f in os.listdir(directory) if f.endswith(".pt") and f.startswith("epoch_")]
+            if not candidates:
+                return None
+            candidates.sort()
+            return os.path.join(directory, candidates[-1])
+        except Exception:
+            return None
+
+    def _save_checkpoint(epoch_idx: int, done: bool = False):
+        if (is_distributed and rank != 0):
+            return
+        to_save = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+        ckpt = {
+            "epoch": epoch_idx,
+            "model": to_save,
+            "optimizer": optimizer.state_dict(),
+            "best_val": best_val,
+            "patience_left": patience,
+            "train_losses": train_losses,
+            "val_losses": val_losses,
+            "done": done,
+        }
+        path_epoch = os.path.join(ckpt_dir, f"epoch_{epoch_idx:04d}.pt")
+        torch.save(ckpt, path_epoch)
+        torch.save(ckpt, os.path.join(ckpt_dir, "latest.pt"))
+
+    def _load_checkpoint_if_any():
+        nonlocal start_epoch, best_val, patience, train_losses, val_losses
+        latest = _latest_checkpoint_path(ckpt_dir) if args.resume else None
+        if latest is None:
+            return None
+        if (not is_distributed) or rank == 0:
+            print(f"Resuming from checkpoint: {latest}", flush=True)
+        map_location = torch.device("cpu") if not torch.cuda.is_available() else None
+        ckpt = torch.load(latest, map_location=map_location)
+        state = ckpt.get("model", ckpt)
+        # Load into model (all ranks load)
+        if hasattr(model, "module"):
+            model.module.load_state_dict(state)
+        else:
+            model.load_state_dict(state)
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])  # optimizer states are safe to restore
+        best_val = ckpt.get("best_val", float("inf"))
+        patience = ckpt.get("patience_left", args.patience)
+        train_losses = ckpt.get("train_losses", [])
+        val_losses = ckpt.get("val_losses", [])
+        last_epoch = int(ckpt.get("epoch", 0))
+        done_flag = bool(ckpt.get("done", False))
+        start_epoch = last_epoch + 1
+        return done_flag, last_epoch
+
+    # Train loop with early stopping + resume
     best_val = float("inf")
     patience = args.patience
     train_losses, val_losses = [], []
+    start_epoch = 1
 
-    for epoch in range(1, args.epochs + 1):
-        print(f"Epoch {epoch}/{args.epochs}", flush=True)
+    # Optional resume
+    done_on_load = None
+    resume_info = _load_checkpoint_if_any()
+    if resume_info is not None:
+        done_on_load, last_epoch_total = resume_info
+        if args.total_epochs and last_epoch_total >= args.total_epochs:
+            if (not is_distributed) or rank == 0:
+                print(f"Total epochs already reached ({last_epoch_total} >= {args.total_epochs}). Exiting.", flush=True)
+            if is_distributed:
+                dist.destroy_process_group()
+            return
+        if done_on_load:
+            if (not is_distributed) or rank == 0:
+                print("Training already marked as done in latest checkpoint. Exiting.", flush=True)
+            if is_distributed:
+                dist.destroy_process_group()
+            return
+
+    # Determine end epoch for this invocation
+    if args.total_epochs and args.total_epochs > 0:
+        end_epoch = min(start_epoch + args.epochs - 1, args.total_epochs)
+    else:
+        end_epoch = start_epoch + args.epochs - 1
+
+    for epoch in range(start_epoch, end_epoch + 1):
+        if is_distributed:
+            # Ensure all processes shuffle differently each epoch
+            train_loader.sampler.set_epoch(epoch)  # type: ignore[attr-defined]
+        if (not is_distributed) or rank == 0:
+            print(f"Epoch {epoch}/{args.epochs}", flush=True)
         tr = train(model, optimizer, criterion, train_loader, device)
         vl = validate(model, criterion, val_loader, device)
+
+        # Average losses across ranks for consistent early stopping
+        if is_distributed:
+            t = torch.tensor([tr, vl], device=device, dtype=torch.float32)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            tr = (t[0].item() / world_size)
+            vl = (t[1].item() / world_size)
         train_losses.append(tr); val_losses.append(vl)
 
-        if vl < best_val:
-            best_val = vl
-            patience = args.patience
-            torch.save(model.state_dict(), os.path.join(args.output_dir, "waveform_n2n_weights.pt"))
+        stop_training = False
+        if (not is_distributed) or rank == 0:
+            if vl < best_val:
+                best_val = vl
+                patience = args.patience
+                to_save = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+                torch.save(to_save, os.path.join(args.output_dir, "waveform_n2n_weights.pt"))
+            else:
+                patience -= 1
+                if patience == 0:
+                    print("Early stopping.", flush=True)
+                    stop_training = True
+        if is_distributed:
+            flag = torch.tensor([1 if stop_training else 0], device=device, dtype=torch.int)
+            dist.broadcast(flag, src=0)
+            if flag.item() == 1:
+                # Save a final checkpoint marking completion, rank 0 only
+                _save_checkpoint(epoch, done=True)
+                break
         else:
-            patience -= 1
-            if patience == 0:
-                print("Early stopping.", flush=True)
+            if stop_training:
+                _save_checkpoint(epoch, done=True)
                 break
 
         # Save curve
-        plt.figure(figsize=(8, 3))
-        plt.plot(train_losses, label="Train")
-        plt.plot(val_losses, label="Val")
-        plt.xlabel("Epoch"); plt.ylabel("MSE (scaled)"); plt.legend(); plt.tight_layout()
-        plt.savefig(os.path.join(args.output_dir, "training_curve.png"))
-        plt.close()
+        if (not is_distributed) or rank == 0:
+            plt.figure(figsize=(8, 3))
+            plt.plot(train_losses, label="Train")
+            plt.plot(val_losses, label="Val")
+            plt.xlabel("Epoch"); plt.ylabel("MSE (scaled)"); plt.legend(); plt.tight_layout()
+            plt.savefig(os.path.join(args.output_dir, "training_curve.png"))
+            plt.close()
+
+        # Periodic checkpoint save
+        if (not is_distributed) or rank == 0:
+            if args.save_every > 0 and (epoch % args.save_every == 0):
+                _save_checkpoint(epoch, done=False)
 
     # Test
     test_loss = validate(model, criterion, test_loader, device)
-    print(f"Test loss (scaled): {test_loss:.6g}")
+    if is_distributed:
+        t = torch.tensor([test_loss], device=device, dtype=torch.float32)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        test_loss = t[0].item() / world_size
+    if (not is_distributed) or rank == 0:
+        print(f"Test loss (scaled): {test_loss:.6g}")
 
     # Save scalers
-    dump(X_scaler, os.path.join(args.output_dir, "waveform_feature_scaler.joblib"))
-    dump(y_scaler, os.path.join(args.output_dir, "waveform_target_scaler.joblib"))
-    print("Saved weights and scalers to:", args.output_dir, flush=True)
+    if (not is_distributed) or rank == 0:
+        dump(X_scaler, os.path.join(args.output_dir, "waveform_feature_scaler.joblib"))
+        dump(y_scaler, os.path.join(args.output_dir, "waveform_target_scaler.joblib"))
+        print("Saved weights and scalers to:", args.output_dir, flush=True)
+
+    if is_distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

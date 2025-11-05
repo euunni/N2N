@@ -1,4 +1,4 @@
-name: N2N
+name: N2N_QML
 channels:
   - pytorch
   - nvidia
@@ -231,4 +231,15 @@ dependencies:
       - spectral==0.23.1
       - tensorboardx==2.6.2.2
       - widgetsnbextension==4.0.10
-prefix: /N2N
+      - pennylane>=0.36
+      - pennylane-lightning>=0.36
+      - pennylane-lightning-gpu>=0.36
+      - cuquantum-cu11
+      - cuquantum-python-cu11
+      - torchview
+      - graphviz
+      - qiskit
+      - qiskit-terra
+      - qiskit-aer
+      - tqdm
+prefix: /N2N_QML
