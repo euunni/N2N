@@ -11,7 +11,7 @@ The environment targets Python 3.11 on Linux and includes Torch, PennyLane, and 
 
 ```bash
 conda env create -f environment.yml
-conda activate N2N
+conda activate N2N_QML
 pip install -e .
 ```
 
