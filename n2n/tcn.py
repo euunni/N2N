@@ -8,6 +8,7 @@ LICENSED UNDER MIT
 
 import torch.nn as nn
 from torch.nn.utils import weight_norm
+import torch.nn.functional as F
 
 class Chomp1d(nn.Module):
     def __init__(self, chomp_size):
@@ -56,7 +57,7 @@ class TemporalBlock(nn.Module):
 
 
 class TemporalConvNet(nn.Module):
-    def __init__(self, num_inputs, num_channels, kernel_size=3, dropout=0.2, use_group_norm: bool = True, gn_groups: int = 8):
+    def __init__(self, num_inputs, num_channels, kernel_size=5, dropout=0.2, use_group_norm: bool = True, gn_groups: int = 8):
         super(TemporalConvNet, self).__init__()
         layers = []
         num_levels = len(num_channels)
@@ -69,7 +70,7 @@ class TemporalConvNet(nn.Module):
                 in_channels,
                 out_channels,
                 kernel_size,
-                stride=1,
+                stride=2,
                 dilation=dilation_size,
                 padding=(kernel_size-1) * dilation_size,
                 dropout=dropout,
@@ -84,12 +85,12 @@ class TemporalConvNet(nn.Module):
 
 
 class Noise2Noise1DTCN(nn.Module):
-    def __init__(self, in_channels=1, num_channels=None, kernel_size=3, dropout=0.1, use_group_norm: bool = True, gn_groups: int = 8):
+    def __init__(self, in_channels=1, num_channels=None, kernel_size=5, dropout=0.1, use_group_norm: bool = True, gn_groups: int = 8):
         super(Noise2Noise1DTCN, self).__init__()
         if num_channels is None:
             # num_channels = [32, 32, 64, 64, 128, 128, 256, 256]
-            num_channels=[8, 8, 16, 16, 32, 32, 64, 64]
-            # num_channels=[8, 8, 8, 16, 16, 16]
+            # num_channels=[8, 8, 16, 16, 32, 32, 64, 64]
+            num_channels=[8, 8, 8, 16, 16, 16]
         self.tcn = TemporalConvNet(
             num_inputs=in_channels,
             num_channels=num_channels,
@@ -104,3 +105,4 @@ class Noise2Noise1DTCN(nn.Module):
         x = self.tcn(x)
         x = self.head(x)
         return x
+        

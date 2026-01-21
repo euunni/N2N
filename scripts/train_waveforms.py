@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Train Noise2Noise1D on 1D waveforms (e.g., per-event 1000-length vectors).
+Train Noise2Noise1D on 1D waveforms (e.g., per-event 1024-length vectors).
 
 Input: a NumPy file (.npy or .npz) containing clean waveforms shaped (n_samples, n_points),
 or a 3D array shaped (E, C, L) which will be flattened to (E*C, L) at load time.
@@ -17,12 +17,16 @@ Example:
 import os
 import sys
 import argparse
+import time
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 from joblib import dump
 
 from n2n.tcn import Noise2Noise1DTCN
@@ -38,19 +42,20 @@ def parse_args():
     p = argparse.ArgumentParser(description="Train Noise2Noise on 1D waveforms")
     p.add_argument("--array_key", default="waves_tower", help="npz key if using .npz (default: waveforms). Common: 'waveforms' or 'waves_tower'")
     p.add_argument("--output_dir", required=True, help="Directory to save weights/scaler/plots")
-    p.add_argument("--epochs", type=int, default=100)
-    p.add_argument("--batch_size", type=int, default=256)
+    p.add_argument("--epochs", type=int, default=200)
+    p.add_argument("--batch_size", type=int, default=200)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--patience", type=int, default=20)
     p.add_argument("--noise_level", type=float, default=0.02)
-    p.add_argument("--min_sigma", type=float, default=0.0, help="Soft-min noise std in raw units; if >0, use sigma = sqrt((noise_level*s)^2 + min_sigma^2) with s=1.4826*MAD per trace")
+    p.add_argument("--min_sigma", type=float, default=5.0, help="Soft-min noise std in raw units; if >0, use sigma = sqrt((noise_level*s)^2 + min_sigma^2) with s=1.4826*MAD per trace")
     p.add_argument("--scaler", choices=["RobustScaler","StandardScaler","MinMaxScaler"], default="RobustScaler")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--events_per_file", type=int, default=2000, help="If input is 3D (E,C,L), randomly sample up to this many events per file before flattening; 0=all")
+    p.add_argument("--events_per_file", type=int, default=200, help="If input is 3D (E,C,L), randomly sample up to this many events per file before flattening; 0=all")
     # Runlist mode only: read split/run/tower from a text file and build inputs
     p.add_argument("--runlist", required=True, help="Path to run list txt: <split_flag> <run_number> <tower> per line; split_flag in {0=train,1=val,2=test}")
-    p.add_argument("--npz_dir", default="/pscratch/sd/h/haeun/TB2025", help="Directory containing per-run npz files (used with --runlist)")
-    p.add_argument("--npz_pattern", default="run_{run}_merged.npz", help="Filename pattern with {run} placeholder (used with --runlist)")
+    p.add_argument("--npz_dir", default="/pscratch/sd/h/haeun/TB2025/1024bins", help="Directory containing per-run npz files (used with --runlist)")
+    p.add_argument("--npz_pattern", default="run_{run}.npz", help="Filename pattern with {run} placeholder (used with --runlist)")
+    p.add_argument("--channel", default="S,C", help="Comma-separated channel suffixes to include for towers from runlist (e.g. 'S' or 'S,C')")
     p.add_argument("--plot_noise", action="store_true", help="Save original vs noisy plots for event 0 per channel (train split)")
     return p.parse_args()
 
@@ -108,11 +113,28 @@ def load_waveforms(path: str, key: str, events_limit: int = 0, seed: int = 42, c
 
 
 def main():
+    start_time = time.perf_counter()
     args = parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
     set_seed(args.seed)
 
-    print("Starting training...", flush=True)
+    # Detect distributed context (torchrun exports LOCAL_RANK/RANK/WORLD_SIZE)
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    is_distributed = world_size > 1 or ("LOCAL_RANK" in os.environ)
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    if is_distributed:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend)
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        rank = 0
+
+    if (not is_distributed) or rank == 0:
+        os.makedirs(args.output_dir, exist_ok=True)
+        print("Starting training...", flush=True)
 
     def _load_concat_pairs(pairs: list[tuple[str, str]], npz_key: str) -> np.ndarray:
         """Load multiple (path, channels) pairs and concatenate (rows)."""
@@ -140,6 +162,7 @@ def main():
     def _read_runlist(path: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[tuple[str, str]]]:
         if not args.npz_dir:
             raise ValueError("--npz_dir is required when using --runlist")
+        suffixes = [s.strip() for s in str(args.channel).split(",") if s.strip()]
         train_pairs: list[tuple[str, str]] = []
         val_pairs: list[tuple[str, str]] = []
         test_pairs: list[tuple[str, str]] = []
@@ -154,16 +177,17 @@ def main():
                 flag = int(cols[0]); run = int(cols[1]); towers = cols[2:]
                 file_path = os.path.join(args.npz_dir, args.npz_pattern.format(run=run))
                 for tower in towers:
-                    ch = f"{tower}S"
-                    pair = (file_path, ch)
-                    if flag == 0:
-                        train_pairs.append(pair)
-                    elif flag == 1:
-                        val_pairs.append(pair)
-                    elif flag == 2:
-                        test_pairs.append(pair)
-                    else:
-                        raise ValueError(f"Invalid split flag {flag} in runlist (use 0,1,2)")
+                    for suf in suffixes:
+                        ch = f"{tower}{suf}"
+                        pair = (file_path, ch)
+                        if flag == 0:
+                            train_pairs.append(pair)
+                        elif flag == 1:
+                            val_pairs.append(pair)
+                        elif flag == 2:
+                            test_pairs.append(pair)
+                        else:
+                            raise ValueError(f"Invalid split flag {flag} in runlist (use 0,1,2)")
         return train_pairs, val_pairs, test_pairs
 
     train_pairs, val_pairs, test_pairs = _read_runlist(args.runlist)
@@ -278,17 +302,39 @@ def main():
     val_ds   = TensorDataset(torch.from_numpy(X_val_s).float(),   torch.from_numpy(y_val_s).float())
     test_ds  = TensorDataset(torch.from_numpy(X_test_s).float(),  torch.from_numpy(y_test_s).float())
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False)
-    test_loader  = DataLoader(test_ds,  batch_size=args.batch_size, shuffle=False)
+    if is_distributed:
+        train_sampler = DistributedSampler(train_ds, shuffle=True, drop_last=False)
+        val_sampler   = DistributedSampler(val_ds, shuffle=False, drop_last=False)
+        test_sampler  = DistributedSampler(test_ds, shuffle=False, drop_last=False)
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler, shuffle=False)
+        val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, sampler=val_sampler,   shuffle=False)
+        test_loader  = DataLoader(test_ds,  batch_size=args.batch_size, sampler=test_sampler,  shuffle=False)
+    else:
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
+        val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False)
+        test_loader  = DataLoader(test_ds,  batch_size=args.batch_size, shuffle=False)
 
     # Model
     # TCN with channel=1, causal (from tcn.py), reasonab le defaults
     model = Noise2Noise1DTCN(in_channels=1, num_channels=None, kernel_size=5, dropout=0.1)
-    device = check_available_device()
-    if device == "cuda" and torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
-    model.to(device)
+    if is_distributed:
+        if torch.cuda.is_available():
+            device = torch.device(f"cuda:{local_rank}")
+        else:
+            device = torch.device("cpu")
+        model.to(device)
+        model = DDP(
+            model,
+            device_ids=[local_rank] if torch.cuda.is_available() else None,
+            output_device=local_rank if torch.cuda.is_available() else None,
+            find_unused_parameters=False,
+        )
+    else:
+        device_str = check_available_device()
+        if device_str == "cuda" and torch.cuda.device_count() > 1:
+            model = nn.DataParallel(model)
+        device = torch.device(device_str)
+        model.to(device)
 
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
@@ -299,37 +345,57 @@ def main():
     train_losses, val_losses = [], []
 
     for epoch in range(1, args.epochs + 1):
-        print(f"Epoch {epoch}/{args.epochs}", flush=True)
+        if is_distributed and hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
+            train_loader.sampler.set_epoch(epoch)  # type: ignore[attr-defined]
+        if (not is_distributed) or rank == 0:
+            print(f"Epoch {epoch}/{args.epochs}", flush=True)
         tr = train(model, optimizer, criterion, train_loader, device)
         vl = validate(model, criterion, val_loader, device)
+        if is_distributed:
+            t = torch.tensor([tr, vl], dtype=torch.float32, device=device)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            tr = (t[0].item() / world_size)
+            vl = (t[1].item() / world_size)
         train_losses.append(tr); val_losses.append(vl)
 
         if vl < best_val:
             best_val = vl
             patience = args.patience
-            torch.save(model.state_dict(), os.path.join(args.output_dir, "waveform_n2n_weights.pt"))
+            if (not is_distributed) or rank == 0:
+                state = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+                torch.save(state, os.path.join(args.output_dir, "waveform_n2n_weights.pt"))
         else:
             patience -= 1
             if patience == 0:
-                print("Early stopping.", flush=True)
+                if (not is_distributed) or rank == 0:
+                    print("Early stopping.", flush=True)
                 break
 
         # Save curve
-        plt.figure(figsize=(8, 3))
-        plt.plot(train_losses, label="Train")
-        plt.plot(val_losses, label="Val")
-        plt.xlabel("Epoch"); plt.ylabel("MSE (scaled)"); plt.legend(); plt.tight_layout()
-        plt.savefig(os.path.join(args.output_dir, "training_curve.png"))
-        plt.close()
+        if (not is_distributed) or rank == 0:
+            plt.figure(figsize=(8, 3))
+            plt.plot(train_losses, label="Train")
+            plt.plot(val_losses, label="Val")
+            plt.xlabel("Epoch"); plt.ylabel("MSE (scaled)"); plt.legend(); plt.tight_layout()
+            plt.savefig(os.path.join(args.output_dir, "training_curve.png"))
+            plt.close()
 
     # Test
     test_loss = validate(model, criterion, test_loader, device)
-    print(f"Test loss (scaled): {test_loss:.6g}")
+    if is_distributed:
+        t = torch.tensor([test_loss], dtype=torch.float32, device=device)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        test_loss = t[0].item() / world_size
+    if (not is_distributed) or rank == 0:
+        print(f"Test loss (scaled): {test_loss:.6g}")
 
     # Save scalers
-    dump(X_scaler, os.path.join(args.output_dir, "waveform_feature_scaler.joblib"))
-    dump(y_scaler, os.path.join(args.output_dir, "waveform_target_scaler.joblib"))
-    print("Saved weights and scalers to:", args.output_dir, flush=True)
+    if (not is_distributed) or rank == 0:
+        dump(X_scaler, os.path.join(args.output_dir, "waveform_feature_scaler.joblib"))
+        dump(y_scaler, os.path.join(args.output_dir, "waveform_target_scaler.joblib"))
+        print("Saved weights and scalers to:", args.output_dir, flush=True)
+        elapsed_s = time.perf_counter() - start_time
+        print(f"Total runtime: {elapsed_s:.2f}s", flush=True)
 
 
 if __name__ == "__main__":

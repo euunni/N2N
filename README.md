@@ -2,7 +2,7 @@
 
 #### Introduction
 
-This package now focuses on denoising 1D waveforms (e.g., per-event vectors of length 1000) with a Noise2Noise 1D model.
+This package now focuses on denoising 1D waveforms (e.g., per-event vectors of length 1024) with a Noise2Noise 1D model.
 
 #### Usage
 The package is designed for Python 3.10+ on Linux/Windows. GPU acceleration is used where available.

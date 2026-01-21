@@ -3,7 +3,7 @@
 Draw the TCN model structure using torchview (Graphviz).
 
 Usage:
-  python -m n2n.draw --out tcn_structure --directory . --length 1000 --format png
+  python -m n2n.draw --out tcn_structure --directory . --length 1024 --format png
 
 Requires:
   pip install torchview graphviz
@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", default="tcn_structure", help="Output filename (without extension)")
     p.add_argument("--directory", default=".", help="Directory to save the image")
     p.add_argument("--format", default="png", choices=["png", "pdf", "svg"], help="Output image format")
-    p.add_argument("--length", type=int, default=1000, help="Example input length L for the 1D waveform")
+    p.add_argument("--length", type=int, default=1024, help="Example input length L for the 1D waveform")
     p.add_argument("--in_channels", type=int, default=1, help="Number of input channels (C)")
     p.add_argument("--kernel_size", type=int, default=3, help="Kernel size for TCN")
     p.add_argument("--dropout", type=float, default=0.1, help="Dropout for TCN")
@@ -47,6 +47,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--show_inner_tensors", action="store_true", help="Show inner tensors and intermediate edges")
     p.add_argument("--no_shapes", action="store_true", help="Hide tensor shapes on edges")
     p.add_argument("--collect_attributes", action="store_true", help="Collect and display module attributes (e.g., dilation, padding)")
+    # Simple preset
+    p.add_argument("--simple", action="store_true", help="Render a compact high-level diagram (no internals)")
     # Graphviz layout tuning
     p.add_argument("--ranksep", type=float, default=None, help="Vertical separation between ranks (inches)")
     p.add_argument("--nodesep", type=float, default=None, help="Separation between nodes on the same rank (inches)")
@@ -88,19 +90,27 @@ def main() -> None:
         example_input = (torch.randn(1, block_in_channels, int(args.length)),)
         graph_name = f"tcn_block_{args.block_index}"
 
+    # Effective visualization options (simple mode overrides some flags)
+    expand_nested = args.expand_nested and (not args.simple)
+    hide_module_functions = (not args.show_module_functions) or args.simple
+    hide_inner_tensors = (not args.show_inner_tensors) or args.simple
+    show_shapes = (not args.no_shapes)
+    collect_attributes = args.collect_attributes and (not args.simple)
+    depth = args.depth if not args.simple else min(args.depth, 3)
+
     # Some torchview versions forward unknown kwargs to model.forward; avoid passing 'format' here.
     g = draw_graph(
         target_module,
         input_data=example_input,
         graph_name=graph_name,
         save_graph=False,
-        expand_nested=args.expand_nested,
-        depth=args.depth,
+        expand_nested=expand_nested,
+        depth=depth,
         graph_dir=args.graph_dir,
-        hide_module_functions=(not args.show_module_functions),
-        hide_inner_tensors=(not args.show_inner_tensors),
-        show_shapes=(not args.no_shapes),
-        collect_attributes=args.collect_attributes,
+        hide_module_functions=hide_module_functions,
+        hide_inner_tensors=hide_inner_tensors,
+        show_shapes=show_shapes,
+        collect_attributes=collect_attributes,
     )
     # Apply additional Graphviz layout attributes for compactness/orientation
     gv = g.visual_graph

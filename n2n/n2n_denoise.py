@@ -9,7 +9,7 @@ from torch.nn import Module
 
 def create_dataloader(
     spectra: np.ndarray,
-    batch_size: int = 1000,
+    batch_size: int = 1024,
 ) -> DataLoader:
     """Create a DataLoader from the spectra.
 
@@ -20,7 +20,7 @@ def create_dataloader(
         Shape (n_samples, n_bands)
     batch_size : int, optional
         The batch size for the DataLoader.
-        Default 1000
+        Default 1024
 
     Returns
     -------
@@ -56,13 +56,12 @@ def denoise_waveforms(
     spectra = np.asarray(waveforms, dtype=float)
     spectra_s = feature_scaler.transform(spectra)
     loader = create_dataloader(spectra_s, batch_size=batch_size)
-    preds = predict(
-        model,
-        loader,
-        torch.device(check_available_device()),
-        show_progress=show_progress,
-        desc="Denoising",
-    )
+    # Use the model's current device (CPU if CUDA OOM fallback occurred)
+    try:
+        model_device = next(model.parameters()).device
+    except StopIteration:
+        model_device = torch.device("cpu")
+    preds = predict(model, loader, model_device, show_progress=show_progress, desc="Denoising")
     preds = preds.cpu().numpy()
     if residual_mode:
         # Prefer performing subtraction in raw space when target scaler available
