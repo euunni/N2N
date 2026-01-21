@@ -52,7 +52,7 @@ def parse_args():
     p.add_argument("--events_per_file", type=int, default=2000, help="If input is 3D (E,C,L), randomly sample up to this many events per file before flattening; 0=all")
     # Runlist mode only: read split/run/tower from a text file and build inputs
     p.add_argument("--runlist", required=True, help="Path to run list txt: <split_flag> <run_number> <tower> per line; split_flag in {0=train,1=val,2=test}")
-    p.add_argument("--npz_dir", default="/pscratch/sd/h/haeun/TB2025", help="Directory containing per-run npz files (used with --runlist)")
+    p.add_argument("--npz_dir", default="/pscratch/sd/h/haeun/TB2025/1000bins", help="Directory containing per-run npz files (used with --runlist)")
     p.add_argument("--npz_pattern", default="run_{run}_merged.npz", help="Filename pattern with {run} placeholder (used with --runlist)")
     p.add_argument("--plot_noise", action="store_true", help="Save original vs noisy plots for event 0 per channel (train split)")
     # Checkpoint/resume options

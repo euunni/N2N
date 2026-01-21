@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH -A m4138
-#SBATCH -C gpu               
-#SBATCH --qos=regular
-#SBATCH --time=20:00:00    
-#SBATCH --nodes=16
+#SBATCH -C gpu
+#SBATCH --qos=overrun
+#SBATCH --time=30:00:00
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=4     
+#SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=32
 #SBATCH --job-name=N2N_QML
 #SBATCH --output=/global/homes/h/haeun/QML/denoising/N2N/TCN_QML/N2N/batch/log/%x-%j.out
@@ -21,14 +21,14 @@ TOTAL_EPOCHS=${TOTAL_EPOCHS:-100}
 
 srun bash -lc '
   source ~/.bashrc && conda activate N2N_QML
-  
+
   mkdir -p "$OUTPUT_DIR" "$CHECKPOINT_DIR"
 
-  MASTER_ADDR=$(scontrol show hostnames $SLURM_NODELIST | head -n1)
+  MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -n1)
   MASTER_PORT=${MASTER_PORT:-29500}
 
   torchrun \
-      --nnodes ${SLURM_NNODES} \
+      --nnodes ${SLURM_JOB_NUM_NODES:-${SLURM_NNODES}} \
       --nproc_per_node ${SLURM_GPUS_ON_NODE:-4} \
       --rdzv_id ${SLURM_JOB_ID} \
       --rdzv_backend c10d \
@@ -42,3 +42,4 @@ srun bash -lc '
       --epochs 1 \
       --batch_size 200 \
       --events_per_file 200
+'
